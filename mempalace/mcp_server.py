@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -71,9 +72,10 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
-    _HNSW_BLOAT_GUARD,
+    _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
+    reset_hnsw_capacity_cache,
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
@@ -101,63 +103,127 @@ from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
 
-def _init_logging() -> None:
-    """Root-logger init: always stderr, optionally append to ``MEMPALACE_LOG_FILE``.
+class _MempalaceLogFilter(logging.Filter):
+    """Pass only records emitted by mempalace's own loggers.
 
-    Stderr-only is the default. When ``MEMPALACE_LOG_FILE`` is set, a
-    ``FileHandler`` is attached so MCP-client failures that the client
-    does not surface (e.g. the ``-32000`` cold-load timeout in #1495)
-    remain diagnosable from the file.
+    Lets the ``MEMPALACE_LOG_FILE`` handler attach to an already-configured
+    root logger (a host app embedding the server, #1860) without copying the
+    host's — or a third-party library's — records into mempalace's diagnostic
+    file. mempalace loggers are ``mempalace`` / ``mempalace.*`` (the dotted
+    ``__name__`` family) plus the flat ``mempalace_mcp`` /
+    ``mempalace_format_miner`` / ``mempalace_hallways`` / ``mempalace_graph``
+    loggers — every one is prefixed ``mempalace``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name
+        return name == "mempalace" or name.startswith(("mempalace.", "mempalace_"))
+
+
+# Preserved across importlib.reload via globals(): a reload re-executes this
+# module body, so a plain ``= False`` would reset the guard and let
+# _init_logging() stack a duplicate file handler. globals().get keeps the prior
+# True so the guard survives reload (#1885 review).
+_logging_configured = globals().get("_logging_configured", False)
+
+
+def _init_logging() -> None:
+    """Configure mempalace logging: stderr by default, optional file append.
+
+    ``MEMPALACE_LOG_FILE``, when set, attaches a ``FileHandler`` so MCP-client
+    failures the client never surfaces (e.g. the ``-32000`` cold-load timeout
+    in #1495) stay diagnosable from the file.
+
+    Root-logger ownership (#1860). The server must not hijack a host
+    application's logging, so the two cases are handled differently:
+
+    * **Root unconfigured** (standalone ``mempalace-mcp``): own it — a stderr
+      handler (plus the optional file handler) via ``basicConfig`` at INFO.
+      The historical behaviour.
+    * **Root already configured** (an app imported ``mempalace.mcp_server``
+      after setting up its own logging): leave the host's level, format, and
+      handlers untouched. Attach only the file handler, filtered to
+      mempalace's own records (`_MempalaceLogFilter`), so the host's logs do
+      not bleed into mempalace's file. With ``MEMPALACE_LOG_FILE`` unset the
+      root logger is not touched at all.
+
+    Previously this called ``logging.basicConfig(..., force=True)``, which
+    reset root's handlers/level/format unconditionally and silently clobbered
+    any host app that had configured logging first (#1860). ``force`` existed
+    (#1495) only to stop ``basicConfig`` no-op'ing when handlers already
+    existed; the filtered additive handler preserves that diagnostic contract
+    without the collateral reset.
+
+    The file handler is mempalace-filtered in both paths, so the file is a
+    clean mempalace-only stream. In the embedded path mempalace's records are
+    still subject to the host's root level — a host wanting INFO diagnostics in
+    the file should not raise root above INFO. The standalone path pins INFO.
 
     Failure modes:
 
-    * Invalid path (missing directory, no perms, Windows NUL byte) →
-      stderr-only with a warning. The env var must not become a new
-      server-start failure surface — that would defeat the diagnostic
-      goal. ``ValueError`` is included in the catch because Windows
-      raises it for paths with embedded NUL bytes, not ``OSError``.
-    * Root logger already configured (host app embedding the server,
-      transitive imports touching ``logging``) → ``force=True`` resets
-      the handlers so MEMPALACE_LOG_FILE's contract holds regardless
-      of what touched root logging first. Without ``force=True``,
-      ``basicConfig`` is a no-op when handlers exist and the env var
-      silently does nothing — exactly the diagnostic black hole #1495
-      exists to close.
-    * Concurrent writers (multiple ``mempalace-mcp`` processes pointing
-      at the same path) interleave at the line level. The handler uses
-      append mode so nothing is overwritten, but operators running
-      Claude Code + Claude Desktop simultaneously should give each
-      process its own log path.
+    * Invalid path (missing directory, no perms, Windows NUL byte) → the file
+      handler is skipped with a warning naming ``MEMPALACE_LOG_FILE``; the
+      server still starts. ``ValueError`` is in the catch because Windows
+      raises it for embedded-NUL paths, not ``OSError``.
+    * Concurrent writers (multiple ``mempalace-mcp`` processes at one path)
+      interleave at the line level; append mode means nothing is overwritten,
+      but give each process its own path.
 
-    ``delay=True`` is intentionally NOT set: deferring the open means an
-    invalid path raises at ``emit()`` time (unhandled), defeating the
-    fail-soft contract. With eager open the same error surfaces inside
-    ``FileHandler.__init__`` and lands in our ``except`` below.
+    ``delay=True`` is intentionally NOT set: deferring the open moves an
+    invalid-path error to ``emit()`` time (unhandled), defeating the fail-soft
+    contract. Eager open lands the same error in ``FileHandler.__init__`` and
+    our ``except`` below.
 
-    Module-level invocation: this function runs at import time, preserving
-    the side effect of the previous module-level ``logging.basicConfig``
-    call. Callers that import ``mempalace.mcp_server`` for introspection
-    (``TOOLS`` dict, handler functions) inherit the reset; this matches
-    pre-PR behaviour and is intentional for an MCP entry-point module.
+    Runs at import time (module-level call below) so importing the module for
+    introspection (``TOOLS`` dict, handler functions) configures logging once.
     """
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    global _logging_configured
+    if _logging_configured:
+        # Idempotent: a second call (e.g. importlib.reload) must not add a
+        # duplicate file handler in the embedded path.
+        return
+    _logging_configured = True
+
     # MEMPALACE_LOG_FILE is operator-supplied and opt-in; this is a
     # local-first server (CLAUDE.md design principle), so no path
     # sanitization — the operator's process UID is the trust boundary.
     log_file = os.environ.get("MEMPALACE_LOG_FILE", "").strip()
+    file_handler: logging.Handler | None = None
     file_handler_error: Exception | None = None
     if log_file:
         try:
-            handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            # Pin the format: the embedded path never calls basicConfig, so set
+            # it here instead of relying on logging's default formatter. The
+            # default already renders "%(message)s", but the explicit set makes
+            # both paths identical and independent of that default (#1885 review).
+            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            # File is a mempalace-only diagnostic stream; keep host / library
+            # records out so it stays useful when the handler rides on a
+            # host-owned root logger (#1860).
+            file_handler.addFilter(_MempalaceLogFilter())
         except (OSError, ValueError) as exc:
             # Fail-soft: see "Invalid path" failure mode above. Broad on
             # (OSError, ValueError) because Windows raises ValueError for
             # NUL-byte paths while POSIX uses OSError for missing-dir / EPERM.
             file_handler_error = exc
-    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers, force=True)
+
+    root = logging.getLogger()
+    if root.handlers:
+        # A host app (or a transitive import) already owns root logging. Do
+        # NOT reset it (#1860) — only add our filtered file handler, if any.
+        if file_handler is not None:
+            root.addHandler(file_handler)
+    else:
+        # Standalone server: own the unconfigured root logger as before.
+        handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+        if file_handler is not None:
+            handlers.append(file_handler)
+        logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers)
+
     if file_handler_error is not None:
         logging.getLogger("mempalace_mcp").warning(
-            "MEMPALACE_LOG_FILE=%r could not be opened (%s); using stderr only",
+            "MEMPALACE_LOG_FILE=%r could not be opened (%s); file logging disabled",
             log_file,
             file_handler_error,
         )
@@ -211,6 +277,23 @@ def _parse_args():
         default=8765,
         help="HTTP port to bind when --transport=http (default: 8765)",
     )
+    parser.add_argument(
+        "--tls-cert",
+        metavar="PATH",
+        help="PEM certificate to terminate TLS on the HTTP transport "
+        "(requires --tls-key; env MEMPALACE_MCP_TLS_CERT)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        metavar="PATH",
+        help="PEM private key matching --tls-cert (env MEMPALACE_MCP_TLS_KEY)",
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Serve a read-only tool surface: the tools that change state are hidden "
+        "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -230,6 +313,16 @@ if _args.backend:
     os.environ["MEMPALACE_BACKEND"] = backend_name
 
 _config = MempalaceConfig()
+
+# Read-only server mode: when on, the tools in _READ_ONLY_REFUSED_TOOLS (defined
+# below) are hidden from tools/list and refused at dispatch (-32003). That is a
+# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved once at
+# startup from --read-only or MEMPALACE_MCP_READ_ONLY. Computed inline (not via
+# _truthy_env, defined below) so it is available to the request path regardless
+# of import order.
+_READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
+    "MEMPALACE_MCP_READ_ONLY", ""
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
@@ -253,6 +346,11 @@ _last_request_time: float = time.monotonic()
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
+# Serializes quick_check runs between the async startup preflight thread and
+# lazy consumers on the protocol thread (double-checked in
+# _ensure_sqlite_integrity_status) so the O(database size) probe never runs
+# twice concurrently.
+_sqlite_integrity_refresh_lock = threading.Lock()
 _SQLITE_INTEGRITY_ERROR_CODE = -32002
 _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
@@ -260,6 +358,19 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         "mempalace_reconnect",
     }
 )
+
+# The startup probe above runs PRAGMA quick_check, which reads every page of
+# chroma.sqlite3 and is therefore O(database size). On multi-GB palaces it can
+# exceed the MCP client's connection/handshake timeout, so the server never
+# finishes starting and the client drops the connection (the peer-writer guard
+# and lazy consumers all funnel through _refresh_sqlite_integrity_status). Skip
+# the *startup* probe when the database exceeds this size (MB). `mempalace
+# repair` still runs the full quick_check via repair.sqlite_integrity_errors
+# before any destructive rebuild, so corruption is still caught where it
+# matters. Set MEMPALACE_STARTUP_INTEGRITY_MAX_MB=0 to disable the gate and
+# always run the startup probe.
+_STARTUP_INTEGRITY_MAX_MB_ENV = "MEMPALACE_STARTUP_INTEGRITY_MAX_MB"
+_STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 
 
 # MCP peer-writer guard (#1818).
@@ -273,17 +384,21 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
         "mempalace_add_drawer",
         "mempalace_delete_drawer",
+        "mempalace_checkpoint",
+        "mempalace_delete_by_source",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -291,37 +406,205 @@ _MUTATING_TOOLS = frozenset(
     }
 )
 
+# The subset of _MUTATING_TOOLS whose write path reaches the chroma vector
+# segment. Deliberately narrower: the knowledge-graph and tunnel/hallway tools
+# keep their own sqlite/JSON state and never touch HNSW, so an unusable vector
+# index has no say over them.
+#
+# The distinction earns its keep because a write into a diverged HNSW segment
+# does not fail — it blocks inside chromadb's Rust upsert with no timeout of its
+# own, for the life of the process, while this server holds the palace mine lock
+# and the writer lease. One stuck call becomes a palace-wide outage that a still
+# healthy handshake hides.
+_VECTOR_WRITE_TOOLS = frozenset(
+    {
+        "mempalace_add_drawer",
+        "mempalace_update_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
+        "mempalace_mine",
+        "mempalace_sync",
+    }
+)
+
+_DIVERGED_INDEX_ERROR_CODE = -32004
+
+# Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
+#
+# _MUTATING_TOOLS is the *palace-write* set: _mcp_peer_writer_refusal consults it
+# to decide which calls need this process to hold the palace mine lock. A tool
+# that never touches Chroma or the knowledge graph has to stay out of that set,
+# or a server that lost the lease to a peer would start refusing calls the lease
+# has no say over.
+#
+# Two tools are exactly that shape, and read-only has to name both because it is
+# a capability boundary rather than a lock: it exists so a shared server can
+# serve recall to a client that must not change server state.
+#
+#   mempalace_hook_settings, given an argument, writes the server's
+#   ~/.mempalace/config.json through MempalaceConfig.set_hook_setting.
+#   service.WRITE_TOOLS already classifies it as a write, which the daemon uses
+#   as an allowlist, so read-only was the odd one out.
+#
+#   mempalace_memories_filed_away unlinks ~/.mempalace/hook_state/last_checkpoint
+#   on both of its branches. Consuming the file is the contract of the tool, but
+#   it is still a delete of state that outlives the process, on behalf of a
+#   client with no write access. (service.classify_tool calls this one "read",
+#   which is wrong for the same reason.)
+#
+# mempalace_reconnect is deliberately NOT here even though it is not write-free:
+# it clears ChromaBackend._quarantined_paths, so the reopen that follows can let
+# quarantine_stale_hnsw rename a segment directory. It is the only way to pick up
+# an external writer's changes, and _SQLITE_INTEGRITY_ALLOWED_TOOLS already keeps
+# it reachable for recovery, so gating it would strand a read-only server on a
+# stale index. This set means "refuse what a client asked to change", not
+# "nothing past here touches the disk" -- opening the palace or the knowledge
+# graph materialises files on its own, which no name-based gate can express.
+_READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
+    "mempalace_hook_settings",
+    "mempalace_memories_filed_away",
+}
+
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discard_mcp_storage_handles() -> None:
+    """Close cached storage handles before changing writer-lease state.
+
+    A stdio reader can hold a genuine read-only ``sqlite_exact`` collection
+    while another process owns the palace. Once this process promotes to
+    writer, that cached collection must not keep routing the mutating request
+    through its ``query_only`` connection. The inverse matters for embedded
+    HTTP: close writable handles before releasing the lifetime lease so no
+    storage client survives beyond the ownership interval.
+
+    Also clears per-process embedder-identity validation for this palace:
+    a prior read-only open of an empty collection may have cached a "validated"
+    key without recording identity on disk; promotion must re-run enforcement
+    so the first writable open still labels drawers with the active model.
+    """
+
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+
+    cached_client = _client_cache
+    try:
+        from .palace import clear_validated_embedder_identity, get_backend_for_palace
+
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+        clear_validated_embedder_identity(_config.palace_path)
+    except Exception:
+        logger.debug("Failed to close cached backend while changing MCP ownership", exc_info=True)
+        try:
+            from .palace import clear_validated_embedder_identity
+
+            clear_validated_embedder_identity(getattr(_config, "palace_path", None))
+        except Exception:
+            logger.debug(
+                "Failed to clear embedder-identity cache while changing MCP ownership",
+                exc_info=True,
+            )
+
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local client while changing ownership",
+                exc_info=True,
+            )
+
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+
+
+def _release_mcp_writer_lock() -> None:
+    """Close writable handles and release this process's palace lease."""
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+
+    lock_cm = _MCP_WRITER_LOCK_CM
+    if lock_cm is None:
+        return
+
+    try:
+        _discard_mcp_storage_handles()
+    finally:
+        # Clear first so the atexit callback and embedded hosts can call this
+        # repeatedly without exiting the same context manager twice.
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        lock_cm.__exit__(None, None, None)
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
-    when another live writer already owns the per-palace lease. Once a server
-    starts read-only it stays read-only for its lifetime; restarting is the
-    safe way to become the writer after the original holder exits.
+    when another live writer already owns the per-palace lease.
+
+    Self-healing: a server that came up read-only (a peer held the lease at
+    startup) RE-ATTEMPTS the non-blocking flock on every subsequent call.
+    ``_mcp_peer_writer_refusal`` invokes this on each mutating tool, so once
+    the original holder exits — the OS releases its flock on process death —
+    the next mutating call transparently promotes this server to writer, with
+    no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
+    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` and
+    ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
+    neither short-circuits a later retry. Peer ownership and transient setup
+    failures can both be corrected without restarting the MCP host.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR
-
-    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
-        return True, ""
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    if _MCP_WRITER_READ_ONLY:
-        return False, _MCP_WRITER_LOCK_ERROR
-
-    if _MCP_WRITER_LOCK_FAILED:
-        return True, _MCP_WRITER_LOCK_ERROR
+    # Deliberately no sticky failure short-circuit here. A peer can exit, a
+    # backend mismatch can be corrected, and lock-directory permissions can be
+    # repaired while this long-lived stdio host remains alive. Each mutating
+    # request therefore gets a fresh ownership attempt.
 
     try:
-        from .palace import MineAlreadyRunning, mine_palace_lock
+        from .palace import (
+            MineAlreadyRunning,
+            backend_requires_single_writer,
+            mine_palace_lock,
+            resolve_backend_name,
+        )
+
+        backend_name = resolve_backend_name(_config.palace_path)
+        if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+            if not backend_requires_single_writer(backend_name):
+                return True, ""
+            logger.warning(
+                "%s cannot bypass the single-writer requirement for local backend %r",
+                _MCP_ALLOW_PEER_WRITER_ENV,
+                backend_name,
+            )
 
         lock_cm = mine_palace_lock(_config.palace_path)
         lock_cm.__enter__()
@@ -336,16 +619,23 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; continuing without "
-            "peer-writer protection"
+            f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
+            "because peer-writer protection could not be established; a later "
+            "mutating request will retry ownership"
         )
-        logger.warning(_MCP_WRITER_LOCK_ERROR)
-        return True, _MCP_WRITER_LOCK_ERROR
+        logger.error(_MCP_WRITER_LOCK_ERROR)
+        return False, _MCP_WRITER_LOCK_ERROR
 
     _MCP_WRITER_LOCK_CM = lock_cm
     import atexit
 
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
+    if not _MCP_WRITER_ATEXIT_REGISTERED:
+        atexit.register(_release_mcp_writer_lock)
+        _MCP_WRITER_ATEXIT_REGISTERED = True
+    # Reads performed before promotion may have cached a query-only SQLite
+    # collection. Drop it while ownership is held so the pending mutating
+    # request reopens a writable handle rather than failing on query_only.
+    _discard_mcp_storage_handles()
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -376,6 +666,33 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     }
 
 
+def _startup_integrity_size_limit_bytes() -> int:
+    """Byte size above which the startup SQLite quick_check is skipped.
+
+    Returns 0 when the gate is disabled (``MEMPALACE_STARTUP_INTEGRITY_MAX_MB``
+    set to 0, a non-positive number, or an unparseable value), meaning the
+    startup probe always runs.
+    """
+
+    raw = os.environ.get(_STARTUP_INTEGRITY_MAX_MB_ENV, "").strip()
+    if not raw:
+        mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    else:
+        try:
+            mb = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; using default %.0f MB",
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+                raw,
+                _STARTUP_INTEGRITY_MAX_MB_DEFAULT,
+            )
+            mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    if mb <= 0:
+        return 0
+    return int(mb * 1024 * 1024)
+
+
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
@@ -385,6 +702,12 @@ def _refresh_sqlite_integrity_status() -> None:
     SQLite-layer corruption (#1818).
     """
 
+    with _sqlite_integrity_refresh_lock:
+        _refresh_sqlite_integrity_status_locked()
+
+
+def _refresh_sqlite_integrity_status_locked() -> None:
+    # Probe body; callers must hold _sqlite_integrity_refresh_lock.
     global _sqlite_integrity_checked
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
@@ -394,6 +717,29 @@ def _refresh_sqlite_integrity_status() -> None:
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
         return
+
+    max_bytes = _startup_integrity_size_limit_bytes()
+    if max_bytes > 0:
+        sqlite_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+        try:
+            db_bytes = os.path.getsize(sqlite_path)
+        except OSError:
+            db_bytes = 0
+        if db_bytes > max_bytes:
+            _sqlite_integrity_checked = True
+            _sqlite_integrity_errors = []
+            _sqlite_integrity_check_error = ""
+            logger.warning(
+                "SQLite startup integrity check skipped: %s is %.0f MB "
+                "(> %.0f MB limit); PRAGMA quick_check would block MCP "
+                "startup. Run `mempalace repair` for a full check, or set "
+                "%s (MB; 0 disables the limit).",
+                sqlite_path,
+                db_bytes / (1024 * 1024),
+                max_bytes / (1024 * 1024),
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+            )
+            return
 
     try:
         from .repair import sqlite_integrity_errors
@@ -419,12 +765,46 @@ def _refresh_sqlite_integrity_status() -> None:
 
 
 def _ensure_sqlite_integrity_status() -> None:
-    if not _sqlite_integrity_checked:
-        _refresh_sqlite_integrity_status()
+    if _sqlite_integrity_checked:
+        return
+    with _sqlite_integrity_refresh_lock:
+        # Double-checked: the startup preflight thread may have finished the
+        # probe while this caller waited on the lock — don't pay the
+        # O(database size) quick_check twice.
+        if not _sqlite_integrity_checked:
+            _refresh_sqlite_integrity_status_locked()
 
 
 def _sqlite_integrity_payload() -> dict:
     _ensure_sqlite_integrity_status()
+
+    # The integrity gate only knows how to check chroma.sqlite3, and
+    # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
+    # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
+    # would imply a verification that never happened and reference a
+    # chroma.sqlite3 the active backend does not use (#1931). Recorded errors
+    # only ever come from the chroma path, so surface them regardless of the
+    # backend lookup (which may itself fail); only the clean case is
+    # reclassified as not-applicable.
+    if not _sqlite_integrity_errors:
+        try:
+            backend_name = _selected_backend_name()
+        except Exception:
+            logger.debug("backend resolution failed for integrity payload", exc_info=True)
+            backend_name = ""
+        if backend_name != "chroma":
+            return {
+                "checked": False,
+                "ok": None,
+                "palace": _config.palace_path or "",
+                "sqlite_path": "",
+                "error_count": 0,
+                "errors": [],
+                "reason": (
+                    "chroma.sqlite3 integrity check does not run for backend "
+                    f"{backend_name or 'unknown'!r}"
+                ),
+            }
 
     payload = {
         "checked": _sqlite_integrity_checked,
@@ -638,6 +1018,12 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
+    # This runs on the #1315 retry path, which drops caches precisely to
+    # re-observe the palace after a transient index error. The capacity verdict
+    # is another cached view of that same palace, so it must be dropped too, or
+    # the retry could be answered from the pre-error verdict (its 10 s ceiling
+    # outlasts the 2 s retry sleep).
+    reset_hnsw_capacity_cache()
     try:
         from .palace import get_backend_for_palace
 
@@ -823,6 +1209,11 @@ def _get_collection(create=False):
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    # Operator read-only mode must never bootstrap a collection. In
+    # particular, sqlite_exact's normal create/open path initializes WAL,
+    # schema, FTS metadata, and commits before the first read.
+    if _READ_ONLY:
+        create = False
     try:
         backend_name = _selected_backend_name()
     except (BackendMismatchError, KeyError) as exc:
@@ -840,6 +1231,18 @@ def _get_collection(create=False):
         return None
 
     if backend_name != "chroma":
+        # Normal stdio MCP remains capable of promotion to writer, but until
+        # it actually owns the palace it must not open sqlite_exact through
+        # the schema-initializing read/write path. This lets recall coexist
+        # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
+        # cached read-only collection before a promoted mutation is handled.
+        collection_read_only = _READ_ONLY or (
+            backend_name == "sqlite_exact"
+            and getattr(_args, "transport", "stdio") == "stdio"
+            and _MCP_WRITER_LOCK_CM is None
+        )
+        if collection_read_only:
+            create = False
         for attempt in range(2):
             try:
                 if (
@@ -860,6 +1263,7 @@ def _get_collection(create=False):
                         collection_name=_config.collection_name,
                         create=create,
                         backend=backend_name,
+                        read_only=collection_read_only,
                     )
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
@@ -960,7 +1364,7 @@ def _get_collection(create=False):
                         metadata={
                             "hnsw:space": "cosine",
                             "hnsw:num_threads": 1,
-                            **_HNSW_BLOAT_GUARD,
+                            **_HNSW_WRITE_DEFAULTS,
                         },
                         **ef_kwargs,
                     )
@@ -1141,6 +1545,15 @@ def _fetch_all_metadata(col, where=None):
     return all_meta
 
 
+def _supports_metadata_facets(col) -> bool:
+    """Return True if the collection's backend implements metadata facets."""
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        return False
+    capabilities = getattr(backend, "capabilities", None)
+    return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
+
+
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
@@ -1204,6 +1617,77 @@ def _sanitize_optional_source_file(value: str = None) -> str:
             f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
         )
     return value
+
+
+def _parse_date_filter(value: Optional[str] = None, field_name: str = "date") -> Optional[datetime]:
+    """Parse an optional ISO-8601 date/datetime filter bound (#1128).
+
+    Accepts a date (``"2026-04-01"``), a naive timestamp
+    (``"2026-04-01T09:30:00"``), or one carrying a ``Z``/``+HH:MM`` offset.
+    Returns a naive ``datetime`` for wall-clock
+    comparison against drawer ``filed_at`` values, which are stored as naive
+    local ISO strings (``datetime.now().isoformat()``). Any timezone offset on
+    the input is dropped so an aware bound never raises a ``TypeError`` against
+    a naive ``filed_at``. Comparison is therefore wall-clock, which is what the
+    local-first single-machine model wants; an offset bound is matched on its
+    wall-clock fields, not its absolute instant, so a bound whose offset differs
+    from the zone ``filed_at`` was recorded in is matched by clock time.
+    The accepted grammar is a date, an ISO timestamp (optionally fractional),
+    and an optional ``Z``/``±HH:MM`` offset; other ISO 8601 forms (basic format,
+    week dates) are outside the contract and are rejected on the Python 3.9 floor
+    even where a newer ``fromisoformat`` would accept them.
+    Blank / whitespace-only means "no filter" (``None``).
+    Raises ``ValueError`` on an unparseable value so the caller can surface a
+    clear error, mirroring the wing/room sanitizers.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be an ISO date string")
+    value = value.strip()
+    if not value:
+        return None
+    # datetime.fromisoformat before Python 3.11 rejects a trailing "Z" (Zulu),
+    # and appending "+00:00" would break a date-only value on 3.9/3.10
+    # ("2026-04-01+00:00" is rejected there). Any offset is dropped below for
+    # wall-clock comparison anyway, so just strip a trailing Z/z; both date and
+    # date-time Zulu inputs then parse on the 3.9 floor.
+    iso = value[:-1] if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be an ISO date string "
+            f"(e.g. '2026-04-01' or '2026-04-01T09:30:00'), got {value!r}"
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _filed_at_in_window(
+    filed_at, since_dt: Optional[datetime], before_dt: Optional[datetime]
+) -> bool:
+    """True if a drawer's ``filed_at`` falls in ``[since, before)`` (#1128).
+
+    ``since`` is inclusive and ``before`` is exclusive, matching the issue spec.
+    Parsing (``Z``/offset normalization, tz drop) is delegated to
+    ``_parse_date_filter`` so a bound and a ``filed_at`` are compared
+    identically. A drawer whose ``filed_at`` is missing or unparseable cannot
+    be confirmed in-window, so it is EXCLUDED whenever a bound is active — a
+    date-filtered listing must never silently include rows of unknown age.
+    """
+    try:
+        filed_dt = _parse_date_filter(filed_at, "filed_at")
+    except ValueError:
+        return False
+    if filed_dt is None:
+        return False
+    if since_dt is not None and filed_dt < since_dt:
+        return False
+    if before_dt is not None and filed_dt >= before_dt:
+        return False
+    return True
 
 
 # ==================== READ TOOLS ====================
@@ -1458,9 +1942,6 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
-    writer_ok, writer_reason = _acquire_mcp_writer_lock()
-    if not writer_ok:
-        logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
 
     if _vector_disabled:
         return _tool_status_via_sqlite()
@@ -1506,13 +1987,47 @@ def tool_status():
         "backend": _selected_backend_name(),
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        if _supports_metadata_facets(col):
+            try:
+                temp_wings = col.facet_counts("wing")
+                wings.update(temp_wings)
+                try:
+                    unknown_wings = count - sum(temp_wings.values())
+                    if unknown_wings > 0:
+                        wings["unknown"] = wings.get("unknown", 0) + unknown_wings
+                except (TypeError, ValueError):
+                    pass
+
+                temp_rooms = col.facet_counts("room")
+                rooms.update(temp_rooms)
+                try:
+                    unknown_rooms = count - sum(temp_rooms.values())
+                    if unknown_rooms > 0:
+                        rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
+                except (TypeError, ValueError):
+                    pass
+
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+                rooms.clear()
+                wings.clear()
+                all_meta = _get_cached_metadata(col)
+                for m in all_meta:
+                    m = m or {}
+                    w = m.get("wing", "unknown")
+                    r = m.get("room", "unknown")
+                    wings[w] = wings.get(w, 0) + 1
+                    rooms[r] = rooms.get(r, 0) + 1
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -1529,7 +2044,7 @@ PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -1567,11 +2082,28 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            temp_wings = col.facet_counts("wing")
+            wings.update(temp_wings)
+            try:
+                unknown_wings = col.count() - sum(temp_wings.values())
+                if unknown_wings > 0:
+                    wings["unknown"] = wings.get("unknown", 0) + unknown_wings
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            wings.clear()
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -1599,13 +2131,34 @@ def tool_list_rooms(wing: str = None):
         return _collection_error_or_no_palace()
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
+    where = {"wing": wing} if wing else None
     try:
-        where = {"wing": wing} if wing else None
-        all_meta = _fetch_all_metadata(col, where=where)
-        for m in all_meta:
-            m = m or {}
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            temp_rooms = col.facet_counts("room", where=where)
+            rooms.update(temp_rooms)
+            try:
+                if wing:
+                    wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
+                    unknown_rooms = wing_count - sum(temp_rooms.values())
+                else:
+                    unknown_rooms = col.count() - sum(temp_rooms.values())
+                if unknown_rooms > 0:
+                    rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            rooms.clear()
+            all_meta = _fetch_all_metadata(col, where=where)
+            for m in all_meta:
+                m = m or {}
+                r = m.get("room", "unknown")
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)
@@ -1624,14 +2177,42 @@ def tool_get_taxonomy():
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            if w not in taxonomy:
-                taxonomy[w] = {}
-            taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            from concurrent.futures import ThreadPoolExecutor
+
+            wing_counts = col.facet_counts("wing")
+            wings = list(wing_counts.keys())
+            temp_taxonomy = {}
+            with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
+                futures = {
+                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                    for wing in wings
+                }
+                for wing, future in futures.items():
+                    room_counts = future.result()
+                    try:
+                        unknown_rooms = wing_counts[wing] - sum(room_counts.values())
+                        if unknown_rooms > 0:
+                            room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
+                    except (TypeError, ValueError):
+                        pass
+                    temp_taxonomy[wing] = room_counts
+                taxonomy.update(temp_taxonomy)
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                if w not in taxonomy:
+                    taxonomy[w] = {}
+                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")
         result["error"] = str(e)
@@ -2407,6 +2988,7 @@ def tool_mine(
     mining — use ``mempalace_sync`` for that.
     """
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning, MineValidationError
 
     if not _config.palace_path:
@@ -2469,7 +3051,7 @@ def tool_mine(
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except MineValidationError as exc:
             return {
@@ -2679,6 +3261,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
 
@@ -2703,7 +3286,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -2729,14 +3312,34 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List logical drawers with pagination."""
+def tool_list_drawers(
+    wing: str = None,
+    room: str = None,
+    since: str = None,
+    before: str = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """List logical drawers with pagination.
+
+    Optional ``since`` / ``before`` filter by drawer ``filed_at`` (ISO date or
+    timestamp): ``since`` is inclusive, ``before`` is exclusive (#1128). A
+    drawer whose ``filed_at`` is missing or unparseable is excluded while a
+    date bound is active. The filter is applied in Python after the rows are
+    fetched — ChromaDB rejects string operands for ``$gte``/``$lt`` (1.5.7),
+    and ``filed_at`` is stored as an ISO string, so a server-side ``where``
+    comparison is not available.
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
 
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
+        since_dt = _parse_date_filter(since, "since")
+        before_dt = _parse_date_filter(before, "before")
+        if since_dt is not None and before_dt is not None and since_dt >= before_dt:
+            raise ValueError(f"since ({since!r}) must be earlier than before ({before!r})")
     except ValueError as e:
         return {"error": str(e)}
 
@@ -2760,6 +3363,14 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
+
+        if since_dt is not None or before_dt is not None:
+            drawers = [
+                d
+                for d in drawers
+                if _filed_at_in_window(d.get("metadata", {}).get("filed_at"), since_dt, before_dt)
+            ]
+
         page = drawers[offset : offset + limit]
 
         return {
@@ -2770,6 +3381,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             "limit": limit,
         }
     except Exception as e:
+        logger.exception("tool_list_drawers failed")
         return {"error": str(e)}
 
 
@@ -2994,6 +3606,57 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     }
 
 
+def tool_kg_supersede(
+    subject: str,
+    predicate: str,
+    old_object: str,
+    new_object: str,
+    at: str = None,
+):
+    """Atomically replace one fact with another at a single shared boundary.
+
+    Closes ``(subject, predicate, old_object)`` and opens
+    ``(subject, predicate, new_object)`` at one shared instant, so a
+    point-in-time query at the boundary returns only the new value. Use this
+    instead of a separate ``kg_invalidate`` + ``kg_add`` when a single-valued
+    fact changes (e.g. a model, employer, or address changes).
+
+    ``at`` accepts ``YYYY-MM-DD`` or a canonical UTC datetime
+    (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
+    """
+    try:
+        subject = sanitize_kg_value(subject, "subject")
+        predicate = sanitize_name(predicate, "predicate")
+        old_object = sanitize_kg_value(old_object, "old_object")
+        new_object = sanitize_kg_value(new_object, "new_object")
+        at = sanitize_iso_temporal(at, "at")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    _wal_log(
+        "kg_supersede",
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "old_object": old_object,
+            "new_object": new_object,
+            "at": at,
+        },
+    )
+
+    # Domain ValueErrors from kg.supersede (e.g. inverted boundary) are left to
+    # bubble to the dispatcher, matching tool_kg_add / tool_kg_invalidate: the
+    # -32000 response carries error_class + message in error.data. Only input
+    # sanitization above returns the {success: False} envelope.
+    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    return {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {new_object}",
+        "superseded": old_object,
+    }
+
+
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity is not None:
@@ -3025,6 +3688,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning
+
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
@@ -3132,6 +3798,21 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "timestamp": now.isoformat(),
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
+        }
+    except MineAlreadyRunning as e:
+        # Order matters: this typed handler precedes the bare Exception below,
+        # mirroring tool_mine / tool_sync. The lock wraps ``col.add`` itself, so
+        # a peer holding it means no entry was filed -- a refusal, not a write
+        # failure -- and the daemon defers such a job rather than dead-lettering
+        # it (#2014). Swallowed into the generic branch the refusal loses
+        # ``error_class``, becomes indistinguishable from a genuine write error,
+        # and the queued diary entry is dropped. The daemon's constant, not a
+        # literal: the two sides are a wire contract, and drift on either end
+        # silently un-fixes #2014.
+        return {
+            "success": False,
+            "error": f"another mine is in progress: {e}",
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3365,7 +4046,10 @@ def tool_reconnect():
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
-    # still applies after the reconnect.
+    # still applies after the reconnect. The probe keeps its own cache
+    # (#1471), so drop that too — otherwise the "re-run" would be served
+    # from the verdict this reconnect is meant to discard.
+    reset_hnsw_capacity_cache()
     _vector_disabled = False
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
@@ -3432,7 +4116,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -3443,6 +4127,9 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
 
     ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
     is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    ``added_by`` attributes the filed drawers; when omitted it falls back to
+    the diary's ``agent_name`` (and then to ``"checkpoint"``), so the agent
+    that filed the session is recorded instead of a generic label.
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
@@ -3459,6 +4146,20 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
+    # the diary's ``agent_name`` (the agent filing this session); otherwise the
+    # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string
+    # value counts as unspecified at each step, so an empty explicit argument
+    # still defers to the diary instead of masking it. The chosen name is stored
+    # verbatim (tool_add_drawer strips lone surrogates but does not case-fold),
+    # matching how every other caller records ``added_by``; the diary index
+    # lowercases the same name separately for case-insensitive reads.
+    resolved_added_by = added_by if isinstance(added_by, str) and added_by.strip() else None
+    if resolved_added_by is None and isinstance(diary, dict):
+        agent = diary.get("agent_name")
+        resolved_added_by = agent if isinstance(agent, str) and agent.strip() else None
+    if resolved_added_by is None:
+        resolved_added_by = "checkpoint"
     for item in items:
         if not isinstance(item, dict):
             out["errors"].append({"item": item, "error": "item must be an object"})
@@ -3481,7 +4182,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -3612,6 +4313,27 @@ TOOLS = {
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
+    },
+    "mempalace_kg_supersede": {
+        "description": "Atomically replace a fact with its successor at a shared boundary. Use when a single-valued fact changes (model, employer, address) instead of separate kg_invalidate + kg_add — a point-in-time query at the boundary then returns only the new value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity whose fact is changing"},
+                "predicate": {
+                    "type": "string",
+                    "description": "The relationship type (e.g. 'uses_model', 'works_at')",
+                },
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+                "at": {
+                    "type": "string",
+                    "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",
+                },
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+        "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
         "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
@@ -3865,6 +4587,10 @@ TOOLS = {
                     "type": "number",
                     "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
                 },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
+                },
             },
             "required": ["items"],
         },
@@ -3983,12 +4709,20 @@ TOOLS = {
         "handler": tool_get_drawer,
     },
     "mempalace_list_drawers": {
-        "description": "List drawers with pagination. Optional wing/room filter. Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
+        "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "since": {
+                    "type": "string",
+                    "description": "Only drawers filed on or after this ISO date/time, inclusive (e.g. '2026-04-01'). Optional.",
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only drawers filed before this ISO date/time, exclusive (e.g. '2026-05-01'). Optional.",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Max results per page (default 20, max 100)",
@@ -4145,12 +4879,98 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
     }
 
 
+def _mcp_read_only_refusal(req_id, tool_name: str):
+    """Refuse state-changing tools when the server runs in read-only mode (#1877).
+
+    Read-only is an operator-set server mode (``--read-only`` /
+    ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
+    it is an unconditional gate so a shared team server can expose recall
+    without write access. Enforced at dispatch, not merely hidden from
+    tools/list, so a client that calls a mutating tool by name is still refused.
+
+    Gates on ``_READ_ONLY_REFUSED_TOOLS``, not ``_MUTATING_TOOLS``: a tool can
+    write outside the palace database, which the peer-writer lease has no reason
+    to arbitrate but read-only still has to refuse.
+    """
+    if not _READ_ONLY or tool_name not in _READ_ONLY_REFUSED_TOOLS:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32003,
+            "message": "Server is in read-only mode; this tool is disabled",
+            "data": {"tool": tool_name},
+        },
+    }
+
+
+def _mcp_diverged_index_refusal(req_id, tool_name: str):
+    """Refuse vector writes while the HNSW segment is known to be diverged.
+
+    The capacity probe (#1222) already routes *reads* around a diverged index:
+    ``search`` and ``check_duplicate`` fall back to BM25-only sqlite. Writes had
+    no such gate — they went straight to chromadb, where an upsert into that same
+    index can never come back. Observed on a 3.7.0 palace whose flushed segment
+    held 803 of 820 embeddings: three of five freshly generated vectors blocked
+    forever (25+ minutes, then killed), the other two committed in 0.03 s, and
+    the same vector reproduced the same verdict on every retry — so a write's
+    fate depended on where its embedding landed in the damaged graph. After
+    ``mempalace repair rebuild-index`` all five committed.
+
+    Refusing is also the honest answer for the write that does not hang: chromadb
+    acknowledges it into sqlite and the metadata segment, then leaves it out of
+    the HNSW segment. That drawer is filed and reported as success while being
+    invisible to vector search — 16 such drawers came out of a single checkpoint
+    that returned "completed successfully in 2s".
+
+    The probe behind this is pure sqlite + pickle, so the gate costs no chromadb
+    interaction on the path it is protecting.
+    """
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        return None
+
+    _refresh_vector_disabled_flag()
+
+    if not _vector_disabled:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _DIVERGED_INDEX_ERROR_CODE,
+            "message": ("Palace vector index is diverged; refusing the write until it is rebuilt"),
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path or "",
+                "vector_disabled_reason": _vector_disabled_reason,
+                "hint": (
+                    "Stop the MemPalace MCP servers, run `mempalace repair rebuild-index`, "
+                    "then mempalace_reconnect. Recall keeps working meanwhile through the "
+                    "BM25 fallback; writes stay refused so they can neither hang inside "
+                    "chromadb nor land outside the index."
+                ),
+            },
+        },
+    }
+
+
 def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     """Run MCP request preflight gates outside handle_request complexity."""
+
+    read_only_error = _mcp_read_only_refusal(req_id, tool_name)
+    if read_only_error is not None:
+        return read_only_error
 
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    diverged_index_error = _mcp_diverged_index_refusal(req_id, tool_name)
+    if diverged_index_error is not None:
+        return diverged_index_error
 
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
@@ -4199,6 +5019,9 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
+        # In read-only mode, hide the refused tools so clients don't advertise
+        # write capabilities they can't use (dispatch also refuses them, #1877).
+        # Same set on both sides, or a tool would be listed and then rejected.
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -4206,6 +5029,7 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
+                    if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
             },
         }
@@ -4298,7 +5122,10 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            with _write_stall_watch(tool_name):
+                result = _decorate_mcp_tool_result(
+                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                )
 
             return {
                 "jsonrpc": "2.0",
@@ -4524,6 +5351,130 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
+_WRITE_STALL_WARN_ENV = "MEMPALACE_MCP_WRITE_STALL_WARN_SECS"
+_WRITE_STALL_WARN_DEFAULT = 60.0
+_WRITE_STALL_EXIT_ENV = "MEMPALACE_MCP_WRITE_STALL_EXIT_SECS"
+_WRITE_STALL_EXIT_DEFAULT = 0.0
+# EX_TEMPFAIL: the palace is fine, this process is not. A client that restarts
+# the server gets a working one; a zero exit would read as an orderly shutdown.
+_WRITE_STALL_EXIT_CODE = 75
+
+_write_stall_lock = threading.Lock()
+# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+_write_stall_inflight: Optional[dict] = None
+
+
+def _write_stall_secs(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %.0fs", env_name, raw, default)
+        return default
+
+
+def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warned: bool):
+    """Decide what an in-flight vector write has earned: ``None``/warn/exit.
+
+    Pure so the thresholds can be tested without a stalled write; ``exit`` is
+    checked first so a single tick can escalate straight past an unsent warning.
+    """
+    if exit_secs > 0 and elapsed >= exit_secs:
+        return "exit"
+    if warn_secs > 0 and elapsed >= warn_secs and not warned:
+        return "warn"
+    return None
+
+
+@contextlib.contextmanager
+def _write_stall_watch(tool_name: str):
+    """Register a vector write as in flight for the stall watchdog."""
+    global _write_stall_inflight
+
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+
+    with _write_stall_lock:
+        _write_stall_inflight = {
+            "tool": tool_name,
+            "since": time.monotonic(),
+            "warned": False,
+        }
+    try:
+        yield
+    finally:
+        with _write_stall_lock:
+            _write_stall_inflight = None
+
+
+def _start_write_stall_watchdog() -> None:
+    """Start a daemon thread that reports a vector write that stopped returning.
+
+    A chromadb write has no timeout of its own. When one blocks, this process
+    holds the dispatch lock, the palace mine lock and the writer lease, so it
+    answers nothing else and every peer session drops to read-only — and no log
+    on the server side says why. The only trace of a 25-minute outage was the
+    client's own "tool still running" ticks; the handshake stayed healthy, and
+    ``mempalace_status`` could not answer because the dispatch lock was held by
+    the stuck call. So the report has to come from a thread that is not waiting
+    on that lock, and it has to reach stderr, where the MCP host records it.
+
+    ``MEMPALACE_MCP_WRITE_STALL_WARN_SECS`` (default 60, 0 disables) sets when to
+    warn. ``MEMPALACE_MCP_WRITE_STALL_EXIT_SECS`` (default 0 = never) lets an
+    operator turn the wedge into a restartable failure: a server stuck inside
+    chromadb will not recover, and exiting is what releases the locks its peers
+    are queued behind.
+    """
+    warn_secs = _write_stall_secs(_WRITE_STALL_WARN_ENV, _WRITE_STALL_WARN_DEFAULT)
+    exit_secs = _write_stall_secs(_WRITE_STALL_EXIT_ENV, _WRITE_STALL_EXIT_DEFAULT)
+    if warn_secs <= 0 and exit_secs <= 0:
+        return
+
+    thresholds = [t for t in (warn_secs, exit_secs) if t > 0]
+    interval = max(1.0, min(15.0, min(thresholds) / 4))
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(interval)
+            with _write_stall_lock:
+                inflight = _write_stall_inflight
+                if inflight is None:
+                    continue
+                elapsed = time.monotonic() - inflight["since"]
+                action = _write_stall_action(elapsed, warn_secs, exit_secs, inflight["warned"])
+                tool = inflight["tool"]
+                if action == "warn":
+                    inflight["warned"] = True
+            if action == "warn":
+                logger.warning(
+                    "%s has been inside the palace write path for %.0fs and has not "
+                    "returned. chromadb writes have no timeout: this server now answers "
+                    "nothing else and holds the writer lease, so peer sessions are "
+                    "read-only. Check `mempalace repair --dry-run` for HNSW divergence; "
+                    "restarting this MCP server releases the locks.",
+                    tool,
+                    elapsed,
+                )
+            elif action == "exit":
+                logger.error(
+                    "%s stalled in the palace write path for %.0fs (limit %s=%.0fs); "
+                    "exiting so the palace locks are released and the client can "
+                    "reconnect. The stalled write is lost — rebuild the index before "
+                    "retrying it.",
+                    tool,
+                    elapsed,
+                    _WRITE_STALL_EXIT_ENV,
+                    exit_secs,
+                )
+                os._exit(_WRITE_STALL_EXIT_CODE)
+
+    t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
 def _start_idle_exit_watchdog() -> None:
     """Start a daemon thread that exits the process after an idle period.
 
@@ -4572,6 +5523,38 @@ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
 _HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV = "MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"
+
+
+def _resolve_tls_paths() -> tuple:
+    """Resolve the TLS cert/key from --tls-cert/--tls-key or env, or (None, None).
+
+    Flags take precedence over ``MEMPALACE_MCP_TLS_CERT`` / ``MEMPALACE_MCP_TLS_KEY``.
+    Both must be given together; one without the other is a configuration error
+    (raised here, before any bind, so it fails loudly at startup).
+    """
+    cert = (
+        getattr(_args, "tls_cert", None) or os.environ.get("MEMPALACE_MCP_TLS_CERT", "")
+    ).strip()
+    key = (getattr(_args, "tls_key", None) or os.environ.get("MEMPALACE_MCP_TLS_KEY", "")).strip()
+    if bool(cert) != bool(key):
+        raise ValueError("TLS requires both --tls-cert and --tls-key (or the matching env vars)")
+    if not cert:
+        return None, None
+    for label, path in (("--tls-cert", cert), ("--tls-key", key)):
+        if not os.path.isfile(path):
+            raise ValueError(f"{label} file not found: {path!r}")
+    return cert, key
+
+
+def _wrap_tls(sock, cert: str, key: str):
+    """Wrap a server socket in a TLS 1.2+ context. Raises on bad cert/key."""
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    return ctx.wrap_socket(sock, server_side=True)
 
 
 def _http_is_loopback(host: str) -> bool:
@@ -4628,10 +5611,47 @@ def _build_http_server(host: str, port: int):
     from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    if (
+        not _http_is_loopback(host)
+        and not auth_token
+        and not _truthy_env(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV)
+    ):
+        raise ValueError(
+            "MEMPALACE_MCP_HTTP_TOKEN is required when binding MCP HTTP to a "
+            f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
+            "when a trusted fronting layer provides access control."
+        )
+
+    # Resolve TLS before bind so a bad cert/key fails loudly rather than at the
+    # first request. TLS is transport encryption only — the bearer-token guard
+    # above still applies on a non-loopback bind.
+    tls_cert, tls_key = _resolve_tls_paths()
 
     class _MCPHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+
+        def handle_error(self, request, client_address):
+            # A client hanging up mid-response makes the send path raise
+            # ConnectionError (BrokenPipeError / ConnectionResetError), or
+            # ssl.SSLEOFError over TLS. That is a routine disconnect, not a
+            # server fault, so log it at DEBUG rather than let the default
+            # handler dump a per-request traceback. Real errors (including
+            # genuine TLS handshake/cert failures) still reach that handler.
+            exc = sys.exc_info()[1]
+            is_disconnect = isinstance(exc, ConnectionError)
+            if not is_disconnect:
+                import ssl
+
+                # Only the abrupt-EOF SSLError; genuine TLS errors must surface.
+                is_disconnect = isinstance(exc, ssl.SSLEOFError)
+            if is_disconnect:
+                logger.debug(
+                    "HTTP client %s disconnected before the response completed",
+                    client_address,
+                )
+                return
+            super().handle_error(request, client_address)
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -4751,6 +5771,10 @@ def _build_http_server(host: str, port: int):
     httpd.enforce_host_pin = _http_is_loopback(host)
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
+    httpd.scheme = "http"
+    if tls_cert:
+        httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
+        httpd.scheme = "https"
     return httpd
 
 
@@ -4764,24 +5788,71 @@ def _serve_http(host: str, port: int) -> None:
     """
     try:
         httpd = _build_http_server(host, port)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
     if not _http_is_loopback(host):
-        logger.warning(
-            "MemPalace MCP HTTP server bound to non-loopback host %s — the palace "
-            "is now reachable from the network and /mcp is unauthenticated unless "
-            "you set MEMPALACE_MCP_HTTP_TOKEN. Bind 127.0.0.1 to keep it local.",
-            host,
-        )
+        if httpd.auth_token:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s; /mcp "
+                "requires the configured bearer token.",
+                host,
+            )
+        else:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s without "
+                "a bearer token because %s is set.",
+                host,
+                _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
+            )
     with httpd:
-        logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
+        logger.info(
+            "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
+            getattr(httpd, "scheme", "http"),
+            host,
+            bound_port,
+            " (TLS)" if getattr(httpd, "scheme", "http") == "https" else "",
+            " (read-only)" if _READ_ONLY else "",
+        )
         try:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
+
+
+def _startup_preflight() -> None:
+    """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
+
+    Runs the same checks the stdio loop used to run synchronously before
+    reading the first request. Failures must never take down the server: the
+    lazy consumers (_ensure_sqlite_integrity_status, _get_client) re-run or
+    re-check on demand, so an exception here only loses the early warning.
+    """
+    try:
+        _ensure_sqlite_integrity_status()
+        _refresh_vector_disabled_flag()
+    except Exception:
+        logger.exception("startup preflight failed")
+
+
+def _drop_broken_stdout() -> None:
+    """Point fd 1 at devnull after a stdout write failed with a pipe error.
+
+    The response line that failed mid-write can leave bytes buffered in
+    ``sys.stdout``; the interpreter's shutdown flush would then re-raise
+    ``BrokenPipeError`` and turn a clean exit into status 120. With fd 1
+    on devnull that final flush drains harmlessly, so the process exits 0
+    and any held flocks (e.g. ``mine_palace``) release via normal
+    teardown.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def _run_stdio_loop() -> None:
@@ -4800,11 +5871,19 @@ def _run_stdio_loop() -> None:
 
     logger.info("MemPalace MCP Server starting...")
 
-    # Pre-flight: probe HNSW capacity before any tool call so the warning
-    # is visible at startup rather than on first use (#1222). Pure
-    # filesystem read; never opens a chromadb client.
-    _refresh_sqlite_integrity_status()
-    _refresh_vector_disabled_flag()
+    # Pre-flight in a background thread: PRAGMA quick_check reads every page
+    # of chroma.sqlite3 (20s+ on multi-GB palaces) and running it before the
+    # protocol loop starves the client's initialize timeout, even though the
+    # handshake itself never touches the database. The #1222 intent (warnings
+    # visible at startup rather than on first use) is preserved — the probe
+    # starts now and logs as soon as it finishes; tool calls that need the
+    # verdict serialize on _sqlite_integrity_refresh_lock via
+    # _ensure_sqlite_integrity_status instead of re-running the probe.
+    threading.Thread(
+        target=_startup_preflight,
+        name="mcp-startup-preflight",
+        daemon=True,
+    ).start()
 
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
@@ -4815,26 +5894,56 @@ def _run_stdio_loop() -> None:
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
 
+    # Say so when a chromadb write stops coming back, from a thread the stuck
+    # call is not blocking.
+    _start_write_stall_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
-            if not line:
-                break
+        except KeyboardInterrupt:
+            break
+        except OSError as exc:
+            # An orphaned pty/pipe surfaces as EIO/EBADF here instead of a
+            # clean EOF — same meaning: the client is gone. Never loop on
+            # it: an orphaned stdio server holding the mine_palace flock
+            # blocked all palace writes for hours (2026-07-10 outage).
+            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            break
+        if not line:
+            logger.info("stdin EOF — client disconnected, shutting down")
+            break
 
-            line = line.strip()
-            if not line:
-                continue
+        line = line.strip()
+        if not line:
+            continue
 
+        payload = None
+        try:
             request = json.loads(line)
             response = handle_request(request)
-
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+            continue
+
+        if payload is None:
+            continue
+        try:
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except KeyboardInterrupt:
+            break
+        except (BrokenPipeError, OSError) as exc:
+            # The client's read end is gone; every future response write
+            # would fail the same way, so treat it like stdin EOF and
+            # shut down instead of swallowing it in the generic handler.
+            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            _drop_broken_stdout()
+            break
 
 
 def _run_http_loop() -> None:
@@ -4843,30 +5952,52 @@ def _run_http_loop() -> None:
     # still cannot masquerade as an HTTP response.
     logger.info("MemPalace MCP HTTP server starting...")
 
-    # The HTTP transport exists for long-lived deployments. Do the cheap
-    # filesystem-only probe before binding, but never make the listener wait on
-    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
-    # soon as the process is alive.
-    _refresh_vector_disabled_flag()
-    _start_idle_exit_watchdog()
+    # A writable HTTP server is a long-lived storage client, so it must own the
+    # local palace before it binds. Refusing at startup avoids advertising a
+    # writable service that will only fail (or race) on its first mutation.
+    # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    owns_writer_lease = False
+    if not _READ_ONLY:
+        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        if not writer_ok:
+            logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
+            raise SystemExit(2)
+        owns_writer_lease = True
 
-    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-    if raw_warmup in _WARMUP_TRUTHY:
+    try:
+        # The HTTP transport exists for long-lived deployments. Do the cheap
+        # filesystem-only probe before binding, but never make the listener wait on
+        # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+        # soon as the process is alive.
+        _refresh_vector_disabled_flag()
+        _start_idle_exit_watchdog()
+        _start_write_stall_watchdog()
 
-        def _warmup_with_lock():
+        raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+        if raw_warmup in _WARMUP_TRUTHY:
+
+            def _warmup_with_lock():
+                with _HTTP_REQUEST_LOCK:
+                    _maybe_eager_warmup_embedder()
+
+            threading.Thread(
+                target=_warmup_with_lock,
+                name="mcp-http-eager-warmup",
+                daemon=True,
+            ).start()
+        elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+            # Keep the same warning behavior as stdio mode for typo values.
+            _maybe_eager_warmup_embedder()
+
+        _serve_http(_args.host, _args.port)
+    finally:
+        if owns_writer_lease:
+            # _serve_http uses daemon request threads, so synchronize with the
+            # dispatch lock before closing storage and exposing the palace to
+            # another process. Response serialization happens after this lock
+            # and no longer touches the backend.
             with _HTTP_REQUEST_LOCK:
-                _maybe_eager_warmup_embedder()
-
-        threading.Thread(
-            target=_warmup_with_lock,
-            name="mcp-http-eager-warmup",
-            daemon=True,
-        ).start()
-    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
-        # Keep the same warning behavior as stdio mode for typo values.
-        _maybe_eager_warmup_embedder()
-
-    _serve_http(_args.host, _args.port)
+                _release_mcp_writer_lock()
 
 
 def main():
